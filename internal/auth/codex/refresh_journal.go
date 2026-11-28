@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -336,6 +337,119 @@ func (r *refreshBodyReadTracker) Close() error {
 	return r.body.Close()
 }
 
+type refreshCountingConn struct {
+	net.Conn
+	inFlight atomic.Int64
+	written  atomic.Int64
+	closed   atomic.Bool
+}
+
+func (c *refreshCountingConn) Write(p []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	c.inFlight.Add(1)
+	defer c.inFlight.Add(-1)
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	n, errWrite := c.Conn.Write(p)
+	if n > 0 {
+		c.written.Add(int64(n))
+	}
+	return n, errWrite
+}
+
+func (c *refreshCountingConn) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
+}
+
+func (c *refreshCountingConn) zeroBytesWrittenSince(startWritten int64) bool {
+	if c == nil {
+		return false
+	}
+	_ = c.Close()
+	// Any in-flight Write may have already transmitted bytes without updating written yet.
+	if c.inFlight.Load() != 0 {
+		return false
+	}
+	return c.written.Load() == startWritten
+}
+
+func cloneIsolatedRefreshTransport(base http.RoundTripper, activeConn *atomic.Pointer[refreshCountingConn]) (*http.Transport, bool) {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	baseTransport, ok := base.(*http.Transport)
+	if !ok || baseTransport == nil {
+		return nil, false
+	}
+	cloned := baseTransport.Clone()
+	// Refresh requests must not reuse stale idle connections from the shared pool.
+	cloned.DisableKeepAlives = true
+
+	// Preserve custom TLS dialers and HTTP/2-only configs verbatim: wrapping a custom
+	// *tls.Conn breaks net/http's ALPN type assertion and counts plaintext rather than
+	// wire bytes, and HTTP/2 control frames can also write independently of requests.
+	hasCustomTLSDialer := cloned.DialTLSContext != nil || cloned.DialTLS != nil
+	canTrackHTTP1Wire := !hasCustomTLSDialer && (cloned.Protocols == nil || cloned.Protocols.HTTP1())
+	if !canTrackHTTP1Wire {
+		return cloned, true
+	}
+
+	if cloned.TLSClientConfig != nil && len(cloned.TLSClientConfig.NextProtos) > 0 {
+		filtered := make([]string, 0, len(cloned.TLSClientConfig.NextProtos))
+		for _, proto := range cloned.TLSClientConfig.NextProtos {
+			if proto != "h2" {
+				filtered = append(filtered, proto)
+			}
+		}
+		if len(filtered) == 0 {
+			// Caller explicitly restricted ALPN to HTTP/2 only; keep transport intact.
+			return cloned, true
+		}
+		tlsCfg := cloned.TLSClientConfig.Clone()
+		tlsCfg.NextProtos = filtered
+		cloned.TLSClientConfig = tlsCfg
+	}
+
+	var http1Only http.Protocols
+	http1Only.SetHTTP1(true)
+	cloned.Protocols = &http1Only
+	cloned.ForceAttemptHTTP2 = false
+	cloned.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+
+	wrapConn := func(conn net.Conn, errDial error) (net.Conn, error) {
+		if errDial != nil || conn == nil {
+			return conn, errDial
+		}
+		tracked := &refreshCountingConn{Conn: conn}
+		activeConn.Store(tracked)
+		return tracked, nil
+	}
+	if cloned.DialContext != nil {
+		baseDialContext := cloned.DialContext
+		cloned.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, errDial := baseDialContext(ctx, network, addr)
+			return wrapConn(conn, errDial)
+		}
+	} else if cloned.Dial != nil {
+		baseDial := cloned.Dial
+		cloned.Dial = func(network, addr string) (net.Conn, error) {
+			conn, errDial := baseDial(network, addr)
+			return wrapConn(conn, errDial)
+		}
+	} else {
+		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		cloned.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, errDial := dialer.DialContext(ctx, network, addr)
+			return wrapConn(conn, errDial)
+		}
+	}
+	return cloned, true
+}
+
 func isTypedPreConnectRefreshError(err error) bool {
 	if err == nil {
 		return false
@@ -349,10 +463,13 @@ func isTypedPreConnectRefreshError(err error) bool {
 }
 
 // doRefreshRequest forbids 307/308 redirects from silently replaying a POST body
-// and classifies errors that occurred strictly before a connection could carry
-// any request bytes.
+// and classifies errors that occurred strictly before any request bytes left the
+// process.
 func (o *CodexAuth) doRefreshRequest(req *http.Request) (*http.Response, error) {
 	var sawPreConn, sawConnReady, sawBodyRead atomic.Bool
+	var haveStartWritten atomic.Bool
+	var startWritten atomic.Int64
+	var activeConn atomic.Pointer[refreshCountingConn]
 	if req != nil {
 		// Prevent net/http.Transport from internally replaying the POST body across connections.
 		req.GetBody = nil
@@ -364,10 +481,22 @@ func (o *CodexAuth) doRefreshRequest(req *http.Request) (*http.Response, error) 
 			DNSStart:          func(httptrace.DNSStartInfo) { sawPreConn.Store(true) },
 			ConnectStart:      func(string, string) { sawPreConn.Store(true) },
 			TLSHandshakeStart: func() { sawPreConn.Store(true) },
-			GotConn:           func(httptrace.GotConnInfo) { sawConnReady.Store(true) },
-			WroteHeaderField:  func(string, []string) { sawConnReady.Store(true) },
-			WroteHeaders:      func() { sawConnReady.Store(true) },
-			WroteRequest:      func(httptrace.WroteRequestInfo) { sawConnReady.Store(true) },
+			GotConn: func(info httptrace.GotConnInfo) {
+				sawConnReady.Store(true)
+				if !info.Reused {
+					if tracked := activeConn.Load(); tracked != nil && tracked.inFlight.Load() == 0 {
+						startWritten.Store(tracked.written.Load())
+						haveStartWritten.Store(true)
+					}
+				}
+			},
+			WroteHeaderField: func(string, []string) { sawConnReady.Store(true) },
+			WroteHeaders:     func() { sawConnReady.Store(true) },
+			WroteRequest: func(info httptrace.WroteRequestInfo) {
+				if info.Err == nil {
+					sawConnReady.Store(true)
+				}
+			},
 		}
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	}
@@ -375,11 +504,20 @@ func (o *CodexAuth) doRefreshRequest(req *http.Request) (*http.Response, error) 
 	if o != nil && o.httpClient != nil {
 		client = *o.httpClient
 	}
+	if isolated, okIsolated := cloneIsolatedRefreshTransport(client.Transport, &activeConn); okIsolated {
+		client.Transport = isolated
+		defer isolated.CloseIdleConnections()
+	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		if !sawConnReady.Load() && !sawBodyRead.Load() && (sawPreConn.Load() || isTypedPreConnectRefreshError(errDo)) {
 			return nil, &RefreshPreSendError{Stage: "connect", Cause: errDo}
+		}
+		if haveStartWritten.Load() {
+			if tracked := activeConn.Load(); tracked.zeroBytesWrittenSince(startWritten.Load()) {
+				return nil, &RefreshPreSendError{Stage: "write-zero", Cause: errDo}
+			}
 		}
 		return nil, &RefreshOutcomeUnknownError{Stage: "transport", Cause: errDo}
 	}

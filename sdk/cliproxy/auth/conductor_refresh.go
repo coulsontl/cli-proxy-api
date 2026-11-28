@@ -1784,6 +1784,8 @@ func (m *Manager) refreshAuthForRequestAtVersion(ctx context.Context, id, failed
 			return nil, errors.New("refresh token requires sign-in")
 		}
 		// Access token has expired (or was rejected by a 401) while refresh grant remains terminally rejected.
+		shouldReschedule := false
+		shouldUnschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil &&
 			current.RegistrationEpoch == auth.RegistrationEpoch &&
@@ -1814,9 +1816,14 @@ func (m *Manager) refreshAuthForRequestAtVersion(ctx context.Context, id, failed
 			if current.LastError.Code == "refresh_outcome_unknown" {
 				current.StatusMessage = current.LastError.Message
 				if current.Status != StatusDisabled {
-					// Job completion reschedules this recovery state, so retain a positive delay.
+					// Retain a positive recovery check delay for both job and on-demand paths.
 					current.NextRefreshAfter = checkNow.Add(refreshCheckInterval)
+					shouldReschedule = true
+				} else {
+					shouldUnschedule = true
 				}
+			} else {
+				shouldUnschedule = true
 			}
 			m.auths[id] = current
 			m.notifyAuthChangeLocked(id)
@@ -1825,7 +1832,11 @@ func (m *Manager) refreshAuthForRequestAtVersion(ctx context.Context, id, failed
 			}
 		}
 		m.mu.Unlock()
-		m.queueRefreshUnschedule(id)
+		if shouldReschedule {
+			m.queueRefreshReschedule(id)
+		} else if shouldUnschedule {
+			m.queueRefreshUnschedule(id)
+		}
 		if auth.RefreshError != nil {
 			return nil, auth.RefreshError
 		}
@@ -2036,12 +2047,20 @@ func (m *Manager) refreshAuthForRequestAtVersion(ctx context.Context, id, failed
 					current.LastError = refreshAccessError(current, sanitizedRefreshErr.Message, accessTokenRejected, wasTerminalUnauthorized)
 					if current.LastError.Code == "refresh_outcome_unknown" {
 						current.StatusMessage = current.LastError.Message
-					} else if unauthorized {
-						current.StatusMessage = "unauthorized"
+						if current.Status != StatusDisabled {
+							current.NextRefreshAfter = now.Add(refreshCheckInterval)
+							shouldReschedule = true
+						} else {
+							shouldUnschedule = true
+						}
 					} else {
-						current.StatusMessage = "unauthorized (refresh token invalid)"
+						if unauthorized {
+							current.StatusMessage = "unauthorized"
+						} else {
+							current.StatusMessage = "unauthorized (refresh token invalid)"
+						}
+						shouldUnschedule = true
 					}
-					shouldUnschedule = true
 				} else if invalidGrant {
 					current.RefreshFailures++
 					current.NextRefreshAfter = now.Add(invalidGrantBackoffDuration(current.RefreshFailures))
@@ -2096,7 +2115,7 @@ func (m *Manager) refreshAuthForRequestAtVersion(ctx context.Context, id, failed
 				}
 			}
 			m.auths[id] = current
-			if shouldUnschedule || hasUnauthorizedAuthFailure(current) {
+			if shouldUnschedule || hasUnauthorizedAuthFailure(current) || (current.LastError != nil && current.LastError.Code == "refresh_outcome_unknown" && current.Unavailable) {
 				m.notifyAuthChangeLocked(id)
 			}
 			if m.scheduler != nil {

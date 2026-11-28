@@ -255,3 +255,276 @@ func TestClaudeAutoRefreshDeferralDoesNotClearPendingBackoffToZero(t *testing.T)
 		t.Fatalf("NextRefreshAfter = %v, want a positive backoff after %v to avoid a tight loop", updated.NextRefreshAfter, now)
 	}
 }
+
+func TestOnDemandRefreshUnknownOutcomeRemainsScheduled_Issue8582(t *testing.T) {
+	t.Run("first_expired_refresh_keeps_recovery_scheduled", func(t *testing.T) {
+		ctx := context.Background()
+		manager := NewManager(nil, nil, nil)
+		executor := &unauthorizedRefreshExecutor{
+			id:         "codex",
+			refreshErr: codex.WrapSIWCRefreshError(&codex.RefreshOutcomeUnknownError{Stage: "transport"}),
+		}
+		manager.RegisterExecutor(executor)
+
+		now := time.Now()
+		auth := &Auth{
+			ID:       "codex-siwc-ondemand-first",
+			Provider: "codex",
+			Status:   StatusActive,
+			Metadata: map[string]any{
+				"use_siwc":      true,
+				"access_token":  "outer-expired",
+				"refresh_token": "outer-refresh",
+				"expired":       now.Add(-time.Hour).Format(time.RFC3339),
+				"siwc": map[string]any{
+					"access_token":  "siwc-expired",
+					"refresh_token": "siwc-unresolved-grant",
+					"client_id":     "oaiapp_test",
+					"expired":       now.Add(-time.Hour).Format(time.RFC3339),
+				},
+			},
+		}
+		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+		loop := newAuthAutoRefreshLoop(manager, refreshCheckInterval, 1)
+		manager.refreshLoop = loop
+		loop.rebuild(now)
+
+		manager.refreshAuth(ctx, auth.ID)
+		loop.applyDirty(time.Now())
+
+		current, ok := manager.GetByID(auth.ID)
+		if !ok || current == nil {
+			t.Fatal("credential missing after refresh")
+		}
+		if current.LastError == nil || current.LastError.Code != "refresh_outcome_unknown" {
+			t.Fatalf("LastError = %#v, want refresh_outcome_unknown", current.LastError)
+		}
+		if current.NextRefreshAfter.IsZero() || !current.NextRefreshAfter.After(now) {
+			t.Fatalf("NextRefreshAfter = %v, want future recovery delay after %v", current.NextRefreshAfter, now)
+		}
+		next, scheduled := loop.peek()
+		if !scheduled {
+			t.Fatal("expected credential with refresh_outcome_unknown to remain scheduled in auto-refresh heap")
+		}
+		if next.Before(current.UpdatedAt.Add(refreshCheckInterval)) {
+			t.Fatalf("scheduled next=%v, want at least %v", next, current.UpdatedAt.Add(refreshCheckInterval))
+		}
+	})
+
+	t.Run("preflight_expired_branch_keeps_recovery_scheduled_on_demand", func(t *testing.T) {
+		ctx := context.Background()
+		manager := NewManager(nil, nil, nil)
+		executor := &unauthorizedRefreshExecutor{id: "codex"}
+		manager.RegisterExecutor(executor)
+
+		now := time.Now()
+		auth := &Auth{
+			ID:                       "codex-siwc-ondemand-preflight",
+			Provider:                 "codex",
+			Status:                   StatusActive,
+			RequiresSignIn:           true,
+			RejectedSIWCRefreshToken: "siwc-unresolved-grant",
+			RefreshError: &Error{
+				Code:       "refresh_outcome_unknown",
+				Message:    "refresh_outcome_unknown: transport",
+				HTTPStatus: http.StatusServiceUnavailable,
+			},
+			Metadata: map[string]any{
+				"use_siwc":      true,
+				"access_token":  "outer-expired",
+				"refresh_token": "",
+				"expired":       now.Add(-time.Hour).Format(time.RFC3339),
+				"siwc": map[string]any{
+					"access_token":  "siwc-expired",
+					"refresh_token": "siwc-unresolved-grant",
+					"client_id":     "oaiapp_test",
+					"expired":       now.Add(-time.Hour).Format(time.RFC3339),
+				},
+			},
+		}
+		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+		loop := newAuthAutoRefreshLoop(manager, refreshCheckInterval, 1)
+		manager.refreshLoop = loop
+		loop.rebuild(now)
+
+		// On-demand refresh without finishRefreshJob enters the expired pre-flight branch.
+		manager.refreshAuth(ctx, auth.ID)
+		loop.applyDirty(time.Now())
+
+		if executor.RefreshCalls() != 0 {
+			t.Fatalf("expected pre-flight branch to skip upstream refresh, got %d calls", executor.RefreshCalls())
+		}
+		current, ok := manager.GetByID(auth.ID)
+		if !ok || current == nil {
+			t.Fatal("credential missing after pre-flight refresh")
+		}
+		if current.LastError == nil || current.LastError.Code != "refresh_outcome_unknown" {
+			t.Fatalf("LastError = %#v, want refresh_outcome_unknown", current.LastError)
+		}
+		if current.NextRefreshAfter.IsZero() || !current.NextRefreshAfter.After(now) {
+			t.Fatalf("NextRefreshAfter = %v, want future recovery delay after %v", current.NextRefreshAfter, now)
+		}
+		next, scheduled := loop.peek()
+		if !scheduled {
+			t.Fatal("pre-flight branch unscheduled recoverable refresh_outcome_unknown credential on demand")
+		}
+		if next.Before(current.UpdatedAt.Add(refreshCheckInterval)) {
+			t.Fatalf("scheduled next=%v, want at least %v", next, current.UpdatedAt.Add(refreshCheckInterval))
+		}
+	})
+
+	t.Run("disabled_preflight_still_unschedules", func(t *testing.T) {
+		ctx := context.Background()
+		manager := NewManager(nil, nil, nil)
+		executor := &unauthorizedRefreshExecutor{id: "codex"}
+		manager.RegisterExecutor(executor)
+
+		now := time.Now()
+		auth := &Auth{
+			ID:                       "codex-siwc-ondemand-disabled",
+			Provider:                 "codex",
+			Status:                   StatusDisabled,
+			Disabled:                 true,
+			RequiresSignIn:           true,
+			RejectedSIWCRefreshToken: "siwc-unresolved-grant",
+			RefreshError: &Error{
+				Code:       "refresh_outcome_unknown",
+				Message:    "refresh_outcome_unknown: transport",
+				HTTPStatus: http.StatusServiceUnavailable,
+			},
+			Metadata: map[string]any{
+				"use_siwc":      true,
+				"access_token":  "outer-expired",
+				"refresh_token": "",
+				"expired":       now.Add(-time.Hour).Format(time.RFC3339),
+				"siwc": map[string]any{
+					"access_token":  "siwc-expired",
+					"refresh_token": "siwc-unresolved-grant",
+					"client_id":     "oaiapp_test",
+					"expired":       now.Add(-time.Hour).Format(time.RFC3339),
+				},
+			},
+		}
+		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+		loop := newAuthAutoRefreshLoop(manager, refreshCheckInterval, 1)
+		manager.refreshLoop = loop
+		loop.upsert(auth.ID, now)
+
+		manager.refreshAuth(ctx, auth.ID)
+		loop.applyDirty(time.Now())
+
+		if _, scheduled := loop.peek(); scheduled {
+			t.Fatal("disabled credential must not remain scheduled")
+		}
+	})
+
+	t.Run("stale_preflight_snapshot_does_not_unschedule_reregistered_auth", func(t *testing.T) {
+		ctx := context.Background()
+		now := time.Now()
+		authID := "codex-siwc-reregistered-preflight"
+
+		var manager *Manager
+		var loop *authAutoRefreshLoop
+		replacementScheduledAt := now.Add(5 * time.Minute)
+		reregistered := false
+		store := &reregisteringJournalStore{
+			onResolve: func() {
+				if reregistered {
+					return
+				}
+				reregistered = true
+				// Replace the same auth ID with a fresh healthy credential before the stale pre-flight locks m.mu.
+				fresh := &Auth{
+					ID:               authID,
+					Provider:         "codex",
+					Status:           StatusActive,
+					NextRefreshAfter: replacementScheduledAt,
+					Metadata: map[string]any{
+						"use_siwc":      true,
+						"access_token":  "fresh-outer",
+						"refresh_token": "fresh-outer-grant",
+						"expired":       now.Add(time.Hour).Format(time.RFC3339),
+						"siwc": map[string]any{
+							"access_token":  "fresh-siwc",
+							"refresh_token": "fresh-siwc-grant",
+							"client_id":     "oaiapp_test",
+							"expired":       now.Add(time.Hour).Format(time.RFC3339),
+						},
+					},
+				}
+				if _, errReg := manager.Register(ctx, fresh); errReg != nil {
+					t.Errorf("re-register replacement auth: %v", errReg)
+				}
+				loop.upsert(authID, replacementScheduledAt)
+			},
+		}
+		manager = NewManager(store, nil, nil)
+		executor := &unauthorizedRefreshExecutor{id: "codex"}
+		manager.RegisterExecutor(executor)
+
+		old := &Auth{
+			ID:                       authID,
+			Provider:                 "codex",
+			Status:                   StatusActive,
+			RequiresSignIn:           true,
+			RejectedSIWCRefreshToken: "old-rejected-grant",
+			RefreshError: &Error{
+				Code:       "invalid_grant",
+				Message:    "refresh_token_reused",
+				HTTPStatus: http.StatusUnauthorized,
+			},
+			Metadata: map[string]any{
+				"use_siwc":      true,
+				"access_token":  "old-outer-expired",
+				"refresh_token": "",
+				"expired":       now.Add(-time.Hour).Format(time.RFC3339),
+				"siwc": map[string]any{
+					"access_token":  "old-siwc-expired",
+					"refresh_token": "old-rejected-grant",
+					"client_id":     "oaiapp_test",
+					"expired":       now.Add(-time.Hour).Format(time.RFC3339),
+				},
+			},
+		}
+		if _, errReg := manager.Register(ctx, old); errReg != nil {
+			t.Fatal(errReg)
+		}
+		loop = newAuthAutoRefreshLoop(manager, refreshCheckInterval, 1)
+		manager.refreshLoop = loop
+		loop.rebuild(now)
+
+		manager.refreshAuth(ctx, authID)
+
+		if !reregistered {
+			t.Fatal("expected RefreshJournalFor hook to trigger re-registration")
+		}
+		loop.applyDirty(now)
+		next, scheduled := loop.peek()
+		if !scheduled {
+			t.Fatal("stale pre-flight snapshot unscheduled the re-registered replacement credential")
+		}
+		if !next.Equal(replacementScheduledAt) {
+			t.Fatalf("replacement scheduled next=%v, want %v", next, replacementScheduledAt)
+		}
+	})
+}
+
+type reregisteringJournalStore struct {
+	onResolve func()
+}
+
+func (s *reregisteringJournalStore) List(context.Context) ([]*Auth, error)       { return nil, nil }
+func (s *reregisteringJournalStore) Save(context.Context, *Auth) (string, error) { return "", nil }
+func (s *reregisteringJournalStore) Delete(context.Context, string) error        { return nil }
+func (s *reregisteringJournalStore) RefreshJournalFor(*Auth) (codex.RefreshJournal, error) {
+	if s.onResolve != nil {
+		s.onResolve()
+	}
+	return nil, nil
+}

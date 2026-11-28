@@ -9,9 +9,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
@@ -399,5 +401,324 @@ func TestJournalRefreshTreatsPeerReleasedClaimAsPreSendRetryable(t *testing.T) {
 	}, func(v ojson.Result) (string, error) { return v.String(), nil })
 	if errSecond != nil || got != "rotated" {
 		t.Fatalf("second attempt after peer release: got=%q, err=%v", got, errSecond)
+	}
+}
+
+type writeControlledConn struct {
+	net.Conn
+	failZeroByte *atomic.Bool
+	failPartial  *atomic.Bool
+}
+
+func (c *writeControlledConn) Write(p []byte) (int, error) {
+	if c.failZeroByte != nil && c.failZeroByte.Load() {
+		return 0, &net.OpError{Op: "write", Net: "tcp", Err: syscall.EPIPE}
+	}
+	if c.failPartial != nil && c.failPartial.Load() {
+		n := len(p)
+		if n > 1 {
+			n = 1
+		}
+		written, _ := c.Conn.Write(p[:n])
+		if written == 0 {
+			written = n
+		}
+		return written, &net.OpError{Op: "write", Net: "tcp", Err: syscall.ECONNRESET}
+	}
+	return c.Conn.Write(p)
+}
+
+func TestSIWCRefreshZeroByteTransportFailureDoesNotPoisonJournal_Issue8582(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	t.Cleanup(resetCodexRefreshGroupForTest)
+
+	t.Run("stale_pooled_idle_connection_zero_byte_write", func(t *testing.T) {
+		var tokenCalls atomic.Int32
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.URL.Path == "/warmup" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "ok")
+				return
+			}
+			tokenCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"access_token":"siwc-fresh-access","refresh_token":"siwc-fresh-refresh","expires_in":3600,"scope":"openid chatgpt.tokens.use.direct"}`)
+		}))
+		t.Cleanup(server.Close)
+
+		restoreEndpoint := OverrideSIWCTokenEndpointURLForTest(strings.TrimRight(server.URL, "/") + "/api/accounts/oauth/token")
+		t.Cleanup(restoreEndpoint)
+
+		var dialCount atomic.Int32
+		var failFirstConn atomic.Bool
+		transport := newRedirectedTransport(t, server, func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
+			var dialer net.Dialer
+			conn, errDial := dialer.DialContext(ctx, network, targetAddr)
+			if errDial != nil {
+				return nil, errDial
+			}
+			if dialCount.Add(1) == 1 {
+				return &writeControlledConn{Conn: conn, failZeroByte: &failFirstConn}, nil
+			}
+			return conn, nil
+		})
+
+		// Warm up the transport's idle pool with conn #1, then kill conn #1 for future writes.
+		warmClient := &http.Client{Transport: transport}
+		warmResp, errWarm := warmClient.Get(strings.TrimRight(server.URL, "/") + "/warmup")
+		if errWarm != nil {
+			t.Fatalf("warmup request failed: %v", errWarm)
+		}
+		_, _ = io.ReadAll(warmResp.Body)
+		_ = warmResp.Body.Close()
+		failFirstConn.Store(true)
+
+		cfg := &config.Config{AuthDir: t.TempDir()}
+		auth := NewCodexAuth(cfg)
+		auth.httpClient.Transport = transport
+
+		tokens, errFirst := auth.RefreshSIWCTokens(context.Background(), "siwc-stale-idle-grant", "oaiapp_stale", "550e8400-e29b-41d4-a716-446655440000")
+		if errFirst != nil {
+			if IsRefreshOutcomeUnknown(errFirst) {
+				t.Fatalf("zero-byte stale idle conn failure poisoned journal as unknown outcome: %v", errFirst)
+			}
+			if !IsRefreshPreSendError(errFirst) {
+				t.Fatalf("expected RefreshPreSendError on zero-byte write failure, got: %v", errFirst)
+			}
+			tokens, errSecond := auth.RefreshSIWCTokens(context.Background(), "siwc-stale-idle-grant", "oaiapp_stale", "550e8400-e29b-41d4-a716-446655440000")
+			if errSecond != nil || tokens == nil || tokens.AccessToken != "siwc-fresh-access" {
+				t.Fatalf("retry after zero-byte failure failed: tokens=%+v, err=%v", tokens, errSecond)
+			}
+		} else if tokens == nil || tokens.AccessToken != "siwc-fresh-access" {
+			t.Fatalf("unexpected tokens on fresh connection: %+v", tokens)
+		}
+		if tokenCalls.Load() != 1 {
+			t.Fatalf("token endpoint calls = %d, want 1", tokenCalls.Load())
+		}
+	})
+
+	t.Run("zero_byte_wire_write_after_tls_handshake_on_h2_capable_server_releases_claim", func(t *testing.T) {
+		var tokenCalls atomic.Int32
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			tokenCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"access_token":"siwc-recovered-zero","refresh_token":"siwc-next-zero","expires_in":3600,"scope":"openid chatgpt.tokens.use.direct"}`)
+		}))
+		server.EnableHTTP2 = true
+		server.StartTLS()
+		t.Cleanup(server.Close)
+
+		restoreEndpoint := OverrideSIWCTokenEndpointURLForTest(strings.TrimRight(server.URL, "/") + "/api/accounts/oauth/token")
+		t.Cleanup(restoreEndpoint)
+
+		var armZeroFail atomic.Bool
+		var failWireZero atomic.Bool
+		armZeroFail.Store(true)
+		transport := newRedirectedTransport(t, server, func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
+			var dialer net.Dialer
+			rawConn, errDial := dialer.DialContext(ctx, network, targetAddr)
+			if errDial != nil {
+				return nil, errDial
+			}
+			return &writeControlledConn{Conn: rawConn, failZeroByte: &failWireZero}, nil
+		})
+		transport.ForceAttemptHTTP2 = true
+
+		cfg := &config.Config{AuthDir: t.TempDir()}
+		auth := NewCodexAuth(cfg)
+		auth.httpClient.Transport = transport
+
+		// Arm zero-byte failure on the underlying TCP socket immediately after TLS handshake (GotConn),
+		// proving HTTP/2 control frames do not pollute the wire count and zero-byte writes release the claim.
+		traceCtx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+			GotConn: func(httptrace.GotConnInfo) {
+				if armZeroFail.Load() {
+					failWireZero.Store(true)
+				}
+			},
+		})
+		_, errFirst := auth.RefreshSIWCTokens(traceCtx, "siwc-zero-write-grant", "oaiapp_zero", "550e8400-e29b-41d4-a716-446655440000")
+		if errFirst == nil {
+			t.Fatal("expected zero-byte wire write failure on first attempt")
+		}
+		if IsRefreshOutcomeUnknown(errFirst) {
+			t.Fatalf("zero-byte wire write failure after GotConn must not be classified as unknown outcome: %v", errFirst)
+		}
+		if !IsRefreshPreSendError(errFirst) {
+			t.Fatalf("expected RefreshPreSendError for zero-byte wire write failure, got: %v", errFirst)
+		}
+		if tokenCalls.Load() != 0 {
+			t.Fatalf("token endpoint calls on zero-byte write = %d, want 0", tokenCalls.Load())
+		}
+
+		armZeroFail.Store(false)
+		failWireZero.Store(false)
+		tokens, errSecond := auth.RefreshSIWCTokens(context.Background(), "siwc-zero-write-grant", "oaiapp_zero", "550e8400-e29b-41d4-a716-446655440000")
+		if errSecond != nil || tokens == nil || tokens.AccessToken != "siwc-recovered-zero" {
+			t.Fatalf("retry after zero-byte write failure failed: tokens=%+v, err=%v", tokens, errSecond)
+		}
+		if tokenCalls.Load() != 1 {
+			t.Fatalf("token endpoint calls after retry = %d, want 1", tokenCalls.Load())
+		}
+	})
+
+	t.Run("partial_wire_write_after_tls_handshake_stays_unknown_outcome", func(t *testing.T) {
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"access_token":"should-not-retry","refresh_token":"should-not-retry","expires_in":3600,"scope":"openid chatgpt.tokens.use.direct"}`)
+		}))
+		t.Cleanup(server.Close)
+
+		restoreEndpoint := OverrideSIWCTokenEndpointURLForTest(strings.TrimRight(server.URL, "/") + "/api/accounts/oauth/token")
+		t.Cleanup(restoreEndpoint)
+
+		var failWirePartial atomic.Bool
+		transport := newRedirectedTransport(t, server, func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
+			var dialer net.Dialer
+			rawConn, errDial := dialer.DialContext(ctx, network, targetAddr)
+			if errDial != nil {
+				return nil, errDial
+			}
+			return &writeControlledConn{Conn: rawConn, failPartial: &failWirePartial}, nil
+		})
+
+		cfg := &config.Config{AuthDir: t.TempDir()}
+		auth := NewCodexAuth(cfg)
+		auth.httpClient.Transport = transport
+
+		traceCtx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+			GotConn: func(httptrace.GotConnInfo) {
+				failWirePartial.Store(true)
+			},
+		})
+		_, errFirst := auth.RefreshSIWCTokens(traceCtx, "siwc-partial-wire-grant", "oaiapp_partial", "550e8400-e29b-41d4-a716-446655440000")
+		if !IsRefreshOutcomeUnknown(errFirst) || IsRefreshPreSendError(errFirst) {
+			t.Fatalf("partial wire write failure must remain RefreshOutcomeUnknownError, got: %v", errFirst)
+		}
+	})
+
+	t.Run("custom_dial_tls_preserves_h2_alpn_and_stays_conservative_on_zero_return", func(t *testing.T) {
+		var observedProto atomic.Int32
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			observedProto.Store(int32(req.ProtoMajor))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"access_token":"siwc-h2-access","refresh_token":"siwc-h2-refresh","expires_in":3600,"scope":"openid chatgpt.tokens.use.direct"}`)
+		}))
+		server.EnableHTTP2 = true
+		server.StartTLS()
+		t.Cleanup(server.Close)
+
+		restoreEndpoint := OverrideSIWCTokenEndpointURLForTest(strings.TrimRight(server.URL, "/") + "/api/accounts/oauth/token")
+		t.Cleanup(restoreEndpoint)
+
+		parsed, errParse := url.Parse(server.URL)
+		if errParse != nil {
+			t.Fatal(errParse)
+		}
+
+		// Part A: custom DialTLSContext negotiating ALPN h2 must succeed over HTTP/2.
+		h2Transport := newRedirectedTransport(t, server, nil)
+		h2Transport.DialContext = nil
+		h2Transport.ForceAttemptHTTP2 = true
+		h2Transport.DialTLSContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			rawConn, errDial := dialer.DialContext(ctx, network, parsed.Host)
+			if errDial != nil {
+				return nil, errDial
+			}
+			tlsCfg := h2Transport.TLSClientConfig.Clone()
+			tlsCfg.NextProtos = []string{"h2"}
+			tlsConn := tls.Client(rawConn, tlsCfg)
+			if errHS := tlsConn.HandshakeContext(ctx); errHS != nil {
+				_ = rawConn.Close()
+				return nil, errHS
+			}
+			return tlsConn, nil
+		}
+		authH2 := NewCodexAuth(&config.Config{AuthDir: t.TempDir()})
+		authH2.httpClient.Transport = h2Transport
+		tokens, errH2 := authH2.RefreshSIWCTokens(context.Background(), "siwc-custom-h2-grant", "oaiapp_h2", "550e8400-e29b-41d4-a716-446655440000")
+		if errH2 != nil || tokens == nil || tokens.AccessToken != "siwc-h2-access" {
+			t.Fatalf("custom DialTLSContext ALPN h2 refresh failed: tokens=%+v, err=%v", tokens, errH2)
+		}
+		if observedProto.Load() != 2 {
+			t.Fatalf("custom DialTLSContext negotiated ProtoMajor = %d, want 2", observedProto.Load())
+		}
+
+		// Part B: custom DialTLSContext where underlying TCP wrote partial TLS record bytes
+		// even though tls.Conn.Write returns (0, err) must stay RefreshOutcomeUnknownError.
+		var failUnderlyingPartial atomic.Bool
+		partialTLSTransport := newRedirectedTransport(t, server, nil)
+		partialTLSTransport.DialContext = nil
+		partialTLSTransport.DialTLSContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			rawConn, errDial := dialer.DialContext(ctx, network, parsed.Host)
+			if errDial != nil {
+				return nil, errDial
+			}
+			controlled := &writeControlledConn{Conn: rawConn, failPartial: &failUnderlyingPartial}
+			tlsCfg := partialTLSTransport.TLSClientConfig.Clone()
+			tlsCfg.NextProtos = []string{"http/1.1"}
+			tlsConn := tls.Client(controlled, tlsCfg)
+			if errHS := tlsConn.HandshakeContext(ctx); errHS != nil {
+				_ = rawConn.Close()
+				return nil, errHS
+			}
+			return tlsConn, nil
+		}
+		authPartial := NewCodexAuth(&config.Config{AuthDir: t.TempDir()})
+		authPartial.httpClient.Transport = partialTLSTransport
+		partialCtx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+			GotConn: func(httptrace.GotConnInfo) {
+				failUnderlyingPartial.Store(true)
+			},
+		})
+		_, errPartial := authPartial.RefreshSIWCTokens(partialCtx, "siwc-custom-tls-partial", "oaiapp_tls_partial", "550e8400-e29b-41d4-a716-446655440000")
+		if !IsRefreshOutcomeUnknown(errPartial) || IsRefreshPreSendError(errPartial) {
+			t.Fatalf("custom DialTLSContext partial underlying TLS write must remain RefreshOutcomeUnknownError, got: %v", errPartial)
+		}
+	})
+}
+
+type blockingWriteConn struct {
+	net.Conn
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingWriteConn) Write(p []byte) (int, error) {
+	close(c.entered)
+	<-c.release
+	return len(p), nil
+}
+
+func (c *blockingWriteConn) Close() error {
+	return nil
+}
+
+func TestRefreshCountingConnRejectsZeroBytesWhileWriteInFlight_Issue8582(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	tracked := &refreshCountingConn{
+		Conn: &blockingWriteConn{entered: entered, release: release},
+	}
+
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		_, _ = tracked.Write([]byte("refresh-grant"))
+	}()
+
+	<-entered
+	if tracked.zeroBytesWrittenSince(0) {
+		close(release)
+		<-writeDone
+		t.Fatal("zeroBytesWrittenSince returned true while a Write was still in flight")
+	}
+
+	close(release)
+	<-writeDone
+	if tracked.zeroBytesWrittenSince(0) {
+		t.Fatal("zeroBytesWrittenSince returned true after in-flight Write transmitted bytes")
 	}
 }
